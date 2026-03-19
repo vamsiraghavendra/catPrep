@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any
@@ -37,6 +38,7 @@ TONE_CATEGORIES = (
 DICT_ENDPOINT = "https://dictionaryapi.com/api/v3/references/collegiate/json/{word}"
 THES_ENDPOINT = "https://dictionaryapi.com/api/v3/references/thesaurus/json/{word}"
 REQUEST_TIMEOUT_S = 30
+AEON_MAX_RETRIES = 3
 MAX_WORDS = 25
 MAX_SYNS_PER_WORD = 12
 
@@ -206,16 +208,56 @@ def extract_topics_from_html(html: str) -> list[str]:
 
 
 def fetch_aeon_article(url: str, session: requests.Session) -> dict[str, Any]:
-    resp = session.get(
-        url,
-        timeout=REQUEST_TIMEOUT_S,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://aeon.co/",
+    }
+    resp = None
+    for attempt in range(1, AEON_MAX_RETRIES + 1):
+        resp = session.get(url, timeout=REQUEST_TIMEOUT_S, headers=headers)
+        if resp.status_code != 429:
+            break
+        retry_after = resp.headers.get("Retry-After", "").strip()
+        try:
+            wait_s = max(1, min(15, int(retry_after)))
+        except ValueError:
+            wait_s = min(15, attempt * 2)
+        time.sleep(wait_s)
+
+    if resp is None:
+        raise RuntimeError("Failed to fetch the Aeon article.")
+
+    if resp.status_code == 429:
+        mirror_url = f"https://r.jina.ai/http://{url.removeprefix('https://').removeprefix('http://')}"
+        mirror_resp = session.get(mirror_url, timeout=REQUEST_TIMEOUT_S)
+        if mirror_resp.status_code == 429:
+            raise RuntimeError(
+                "Aeon is rate-limiting requests right now (HTTP 429). "
+                "Please wait a few minutes and try again."
             )
-        },
-    )
+        mirror_resp.raise_for_status()
+        mirror_text = re.sub(r"\s+", " ", mirror_resp.text).strip()
+        if len(mirror_text) < 500:
+            raise RuntimeError(
+                "Aeon is rate-limiting requests right now (HTTP 429). "
+                "Please wait a few minutes and try again."
+            )
+        word_count = len(mirror_text.split())
+        return {
+            "title": url,
+            "text": mirror_text,
+            "word_count": word_count,
+            "genre": extract_genre_from_url(url),
+            "section": None,
+            "author": None,
+            "topics": [],
+        }
+
     resp.raise_for_status()
     html = resp.text
     if "Vercel Security Checkpoint" in html:
